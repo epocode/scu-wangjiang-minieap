@@ -1,44 +1,79 @@
-# 实测排查记录（2026-10-11）
+# R3S 具体修改记录
 
-## 问题与边界
+日期：2026-10-11。实测设备：NanoPi R3S LTS / FriendlyWrt 21.02.7 / ARM64。
 
-望江有线校园网通过 Windows 四川大学认证客户端选择电信出口；原 R3S MiniEAP 配置只能用于校园网，用户希望路由器自行认证。电脑曾在插入离线路由器后优先使用有线默认路由，手机 USB 网络因此不能正常承担外网连接；这是电脑路由选择问题，与锐捷认证是否成功要分别排查。
+## 1. 认证配置
 
-## 排查结论
+创建 `/etc/minieap-scu.conf`，填写学号和学校认证密码，权限设为 `600`。其余主要参数：
 
-1. 本机旧 MiniEAP 配置中的凭据是电信手机号，实际 Windows 客户端用学号登录。最终使用用户在本机私有页面填写的学号和学校认证密码，未将凭据写入公开资料。
-2. 从官方客户端数据包读取到服务名 `电信出口`：GBK `b5e7d0c5b3f6bfda`，所在属性为 `0x39`，固定宽度字段余下填零。MiniEAP 直接复制服务名字节，配置生成时必须准确写入 GBK。
-3. 当电脑没有有效 IPv4 时，官方客户端报 IP 信息错误，只读到退出包。公开头部中 `8021x.exe` 程序名后面的固定版本字节为 `06 52 00 00`；6.82 中十进制 82 对应十六进制 `52`。
-4. 未改固定版本常量时，服务端返回“不允许使用的客户端类型！”。对该次 ARM64 构建的两条指令作常量修改后通过认证。
-5. 退出包的 `0x6f` 版本字符串属性为空。直接复制该空值到认证响应会停在用户名阶段；最终保留 `RG-SU For Linux V1.30`。本次没有修改全部字段，也没有实现新的密码校验算法。
-6. 认证后 DHCP 使用 `dhcp-type=2`，脚本调用 `ubus call network.interface.wan renew '{}'`。服务由 procd 管理，前台运行，进程退出后等待 30 秒再拉起，配置了有限连续失败次数以避免高速重试。
+```ini
+nic=eth0
+module=rjv3
+if-impl=sockraw
+eap-bcast-addr=1
+version-str=RG-SU For Linux V1.30
+heartbeat=60
+dhcp-type=2
+dhcp-script=/usr/libexec/scu-dhcp-renew.sh
+stage-timeout=5
+max-retries=4
+max-fail=3
+wait-after-fail=30
+daemonize=0
+pid-file=/var/run/minieap-scu.pid
+```
 
-源码等效修改位置：`packet_plugin/rjv3/packet_plugin_rjv3_priv.c` 的 `rjv3_append_priv_header` 中：
+## 2. 服务名改为 GBK 的“电信出口”
+
+在 R3S 写入配置：
+
+```sh
+service_name=$(printf '\265\347\320\305\263\366\277\332')
+sed -i '/^service=/d' /etc/minieap-scu.conf
+printf 'service=%s\n' "$service_name" >> /etc/minieap-scu.conf
+```
+
+实际写入字节：`b5 e7 d0 c5 b3 f6 bf da`。
+
+## 3. 修改 MiniEAP 固定版本字段
+
+将 R3S 的 `/usr/sbin/minieap` 下载到电脑，在该 ARM64 程序中修改两条指令：
+
+| 文件偏移 | 原字节 | 修改后 |
+| --- | --- | --- |
+| `0x31a4` | `20 e0 83 52` | `c0 40 8a 52` |
+| `0x31ac` | `20 40 a0 72` | `00 00 a0 72` |
+
+只适用于 [README](../README.md) 中列出的原 SHA256。仓库的 `tools/patch_binary.py` 会校验哈希后修改。
+
+固定版本字段从 `01 1f 01 02` 改成 `06 52 00 00`。源码等效修改位于 `packet_plugin/rjv3/packet_plugin_rjv3_priv.c` 的 `rjv3_append_priv_header`：
 
 ```diff
 - uint8_t _version[4] = {0x01, 0x1f, 0x01, 0x02};
 + uint8_t _version[4] = {0x06, 0x52, 0x00, 0x00};
 ```
 
-二进制修改位置与原／新指令字节（仅适用于 README 中的原 SHA256）：
+当时将修改后的程序上传为 `/tmp/minieap-scu-682-test`，在 R3S 安装：
 
-| 文件偏移 | 原指令 | 新指令 |
-| --- | --- | --- |
-| `0x31a4` | `20 e0 83 52` | `c0 40 8a 52` |
-| `0x31ac` | `20 40 a0 72` | `00 00 a0 72` |
+```sh
+cp /tmp/minieap-scu-682-test /usr/sbin/minieap-scu
+chmod 755 /usr/sbin/minieap-scu
+```
 
-## 验证记录
+原 `/usr/sbin/minieap` 保留。新启动服务使用 `/usr/sbin/minieap-scu`。
 
-| 检查 | 结果 |
-| --- | --- |
-| MiniEAP 认证 | 成功，并收到四川大学欢迎信息 |
-| 直接通过路由器 WAN 请求校外 HTTPS | HTTP 200 |
-| IPv4 出口 | Chinanet SC，AS4134 CHINANET BACKBONE |
-| 认证服务重启 | 再次认证成功，校外 HTTPS 和电信出口仍正常 |
-| 开机启动 | 已建立启用链接 |
-| 整机冷启动时间 | 未测试 |
-| 拔线与恢复、进程异常恢复、长期稳定性 | 未完成实测；只配置了重新认证和进程重启机制 |
+## 4. DHCP 与自动启动
 
-WAN MAC 未修改。MAC 绑定免认证与本次自动认证不是同一项验证。公开记录省略学号、手机号、密码、个人 MAC、路由器 SSH 密码、公网 IP、原始配置和抓包文件。
+创建 `/usr/libexec/scu-dhcp-renew.sh`，调用：
 
-此结论来自单台设备、单个接入环境，不能说明任意固件或所有川大端口都只需同样修改。
+```sh
+ubus call network.interface.wan renew '{}'
+```
+
+创建 `/etc/init.d/minieap-scu`，由 procd 管理前台进程，配置 `respawn 3600 30 0`，启用开机启动。
+
+## 5. 验证结果
+
+认证成功，WAN 校外 HTTPS 返回 HTTP 200，IPv4 出口为 Chinanet SC / AS4134。重启认证服务后再次验证成功。
+
+WAN MAC 未修改；整台 R3S 未重启。冷启动、拔线恢复和长期稳定性尚未实测。

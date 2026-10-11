@@ -1,0 +1,17 @@
+/local/
+/vendor/
+/build/
+__pycache__/
+*.pyc
+*.conf
+*.pcap
+*.pcapng
+*.mpf
+*.log
+*.ipk
+*.exe
+*.bin
+minieap.original
+minieap-scu
+.env
+.env.*
